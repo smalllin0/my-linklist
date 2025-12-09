@@ -7,10 +7,10 @@
 #include <memory>
 #include <type_traits>
 
-using INDEX = int16_t;
-using SIZE = int16_t;
+using Index = int16_t;
+using SizeType = int16_t;
 
-template<typename T, SIZE Capacity>
+template<typename T, SizeType Capacity>
 class MyList {
 public:
     // 非const迭代器
@@ -22,16 +22,16 @@ public:
         using pointer = T*;
         using reference = T&;
 
-        Iterator(MyList* list, INDEX current)
-            : list_(list), current_(current)
+        Iterator(MyList* owner, Index current_index)
+            : owner_(owner), current_index_(current_index)
         {}
-        reference operator*() const { return *(list_->ptr(current_)); }
-        pointer operator->() const { return list_->ptr(current_); }
+        reference operator*() const { return *(owner_->element_ptr(current_index_)); }
+        pointer operator->() const { return owner_->element_ptr(current_index_); }
         
 
         Iterator& operator++() {
-            if (current_ != -1) {
-                current_ = list_->node_[current_].next;
+            if (current_index_ != -1) {
+                current_index_ = owner_->nodes_[current_index_].next_index;
             }
             return *this;
         }
@@ -41,14 +41,14 @@ public:
             return tmp;
         }
         bool operator==(const Iterator& other) const {
-            return current_ == other.current_;
+            return current_index_ == other.current_index_;
         }
         bool operator!=(const Iterator& other) const {
-            return current_ != other.current_;
+            return current_index_ != other.current_index_;
         }
     private:
-        MyList*         list_;
-        INDEX           current_;
+        MyList*         owner_;
+        Index           current_index_;
         
         friend class MyList;
     };
@@ -62,16 +62,16 @@ public:
         using pointer = const T*;
         using reference = const T&;
 
-        ConstIterator(const MyList* list, INDEX current)
-            : list_(list), current_(current)
+        ConstIterator(const MyList* owner, Index current_index)
+            : owner_(owner), current_index_(current_index)
         {}
-        reference operator*() const { return *list_->ptr(current_); }
-        pointer operator->() const { return list_->ptr(current_); }
+        reference operator*() const { return *owner_->element_ptr(current_index_); }
+        pointer operator->() const { return owner_->element_ptr(current_index_); }
         
 
         ConstIterator& operator++() {
-            if (current_ != -1) {
-                current_ = list_->node_[current_].next;
+            if (current_index_ != -1) {
+                current_index_ = owner_->nodes_[current_index_].next_index;
             }
             return *this;
         }
@@ -81,28 +81,28 @@ public:
             return tmp;
         }
         bool operator==(const ConstIterator& other) const {
-            return current_ == other.current_;
+            return current_index_ == other.current_index_;
         }
         bool operator!=(const ConstIterator& other) const {
-            return current_ != other.current_;
+            return current_index_ != other.current_index_;
         }
     private:
-        const MyList*   list_;
-        INDEX           current_;
+        const MyList*   owner_;
+        Index           current_index_;
         
         friend class MyList;
     };
 
     MyList() {
-        for (SIZE i = 0; i < Capacity; i++) {
-            node_[i].prev = -1;
-            node_[i].next = i + 1;
+        for (SizeType i = 0; i < Capacity; i++) {
+            nodes_[i].prev_index = -1;
+            nodes_[i].next_index = i + 1;
         }
-        node_[Capacity - 1].next = -1;
-        free_head_ = 0;
-        used_head_ = -1;
-        used_tail_ = -1;
-        size_ = 0;
+        nodes_[Capacity - 1].next_index = -1;
+        free_list_head_ = 0;
+        head_index_ = -1;
+        tail_index_ = -1;
+        count_ = 0;
     }
     ~MyList() { clear(); }
 
@@ -111,58 +111,58 @@ public:
     MyList(MyList&&) = delete;
     MyList& operator=(MyList&&) = delete;
     
-    SIZE size() const { 
-        std::lock_guard<std::mutex> lock(mutex_);
-        return size_; 
+    SizeType size() const { 
+        std::lock_guard<std::mutex> lock(lock_);
+        return count_; 
     }
     bool empty() const { 
-        std::lock_guard<std::mutex> lock(mutex_);
-        return size_ == 0; 
+        std::lock_guard<std::mutex> lock(lock_);
+        return count_ == 0; 
     }
     bool full() const { 
-        std::lock_guard<std::mutex> lock(mutex_);
-        return size_ == Capacity; 
+        std::lock_guard<std::mutex> lock(lock_);
+        return count_ == Capacity; 
     }
-    static constexpr SIZE capacity() { return Capacity; }
+    static constexpr SizeType capacity() { return Capacity; }
     
     // 非const版本的begin/end
-    Iterator begin() { return Iterator(this, used_head_); }
+    Iterator begin() { return Iterator(this, head_index_); }
     Iterator end() { return Iterator(this, -1); }
     
     // const版本的begin/end  
-    ConstIterator begin() const { return ConstIterator(this, used_head_); }
+    ConstIterator begin() const { return ConstIterator(this, head_index_); }
     ConstIterator end() const { return ConstIterator(this, -1); }
     
     // 明确标记的const版本
-    ConstIterator cbegin() const { return ConstIterator(this, used_head_); }
+    ConstIterator cbegin() const { return ConstIterator(this, head_index_); }
     ConstIterator cend() const { return ConstIterator(this, -1); }
 
     template<typename U>
     bool push_back(U&& data) {
-        INDEX index;
+        Index index;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (free_head_ == -1) {
+            std::lock_guard<std::mutex> lock(lock_);
+            if (free_list_head_ == -1) {
                 return false;
             }
-            index = free_head_;
-            free_head_ = node_[free_head_].next;
+            index = free_list_head_;
+            free_list_head_ = nodes_[free_list_head_].next_index;
         }
         
         // 直接在其上使用placement new构造对象
-        new (ptr(index)) T(std::forward<U>(data));
+        new (element_ptr(index)) T(std::forward<U>(data));
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            node_[index].prev = used_tail_;
-            node_[index].next = -1;
+            std::lock_guard<std::mutex> lock(lock_);
+            nodes_[index].prev_index = tail_index_;
+            nodes_[index].next_index = -1;
 
-            if (used_tail_ != -1) {
-                node_[used_tail_].next = index;
+            if (tail_index_ != -1) {
+                nodes_[tail_index_].next_index = index;
             } else {
-                used_head_ = index;
+                head_index_ = index;
             }
-            used_tail_ = index;
-            size_ ++;
+            tail_index_ = index;
+            count_ ++;
         }
         return true;
     }
@@ -172,62 +172,61 @@ public:
     /// @param fn 接受一个地址参数，应该在该地址上构造对象
     template<typename Construct>
     bool construct(Construct fn) {
-        INDEX index;
+        Index index;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (free_head_ == -1) {
+            std::lock_guard<std::mutex> lock(lock_);
+            if (free_list_head_ == -1) {
                 return false;
             }
-            index = free_head_;
-            free_head_ = node_[free_head_].next;
+            index = free_list_head_;
+            free_list_head_ = nodes_[free_list_head_].next_index;
         }
         
-        fn(ptr(index));
+        fn(element_ptr(index));
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            node_[index].prev = used_tail_;
-            node_[index].next = -1;
+            std::lock_guard<std::mutex> lock(lock_);
+            nodes_[index].prev_index = tail_index_;
+            nodes_[index].next_index = -1;
 
-            if (used_tail_ != -1) {
-                node_[used_tail_].next = index;
+            if (tail_index_ != -1) {
+                nodes_[tail_index_].next_index = index;
             } else {
-                used_head_ = index;
+                head_index_ = index;
             }
-            used_tail_ = index;
-            size_ ++;
+            tail_index_ = index;
+            count_ ++;
         }
 
         return true;
     }
 
     std::unique_ptr<T> pop_front() {
-        INDEX old_head;
-        T* data_ptr = nullptr;
+        Index old_head;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (used_head_ == -1) {
+            std::lock_guard<std::mutex> lock(lock_);
+            if (head_index_ == -1) {
                 return nullptr;
             }
-            auto old_head = used_head_;
-            used_head_ = node_[old_head].next;
-            if (used_head_ != -1) {
-                node_[used_head_].prev = -1;
+            old_head = head_index_;
+            head_index_ = nodes_[old_head].next_index;
+            if (head_index_ != -1) {
+                nodes_[head_index_].prev_index = -1;
             } else {
-                used_tail_ = -1;
+                tail_index_ = -1;
             }
         }
         
-        auto result = std::make_unique<T>(std::move(*ptr(old_head)));
+        auto result = std::make_unique<T>(std::move(*element_ptr(old_head)));
         // 保留手动析构（因为这个对象会一直存在容器中）
-        ptr(old_head)->~T();
+        element_ptr(old_head)->~T();
 
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(lock_);
             
-            node_[old_head].next = free_head_;
-            node_[old_head].prev = -1;
-            free_head_ = old_head;
-            size_ --;
+            nodes_[old_head].next_index = free_list_head_;
+            nodes_[old_head].prev_index = -1;
+            free_list_head_ = old_head;
+            count_ --;
         }
 
         return result;
@@ -239,47 +238,47 @@ public:
     /// @note 消费函数不应抛出异常，否则会导致资源泄漏
     template<typename Consumer>
     void consume_front(Consumer fn) {
-        INDEX old_head;
+        Index old_head;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(lock_);
 
-            if (used_head_ == -1) {
+            if (head_index_ == -1) {
                 return;
             }
-            old_head = used_head_;
+            old_head = head_index_;
             // 更新链表结构
-            used_head_ = node_[old_head].next;
-            if (used_head_ != -1) {
-                node_[used_head_].prev = -1;
+            head_index_ = nodes_[old_head].next_index;
+            if (head_index_ != -1) {
+                nodes_[head_index_].prev_index = -1;
             } else {
-                used_tail_ = -1;
+                tail_index_ = -1;
             }
         }
         
         // 先处理对象
-        fn(ptr(old_head));
+        fn(element_ptr(old_head));
         // 然后销毁
-        ptr(old_head)->~T();
+        element_ptr(old_head)->~T();
 
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            node_[old_head].next = free_head_;
-            node_[old_head].prev = -1;
-            free_head_ = old_head;
-            size_ --;
+            std::lock_guard<std::mutex> lock(lock_);
+            nodes_[old_head].next_index = free_list_head_;
+            nodes_[old_head].prev_index = -1;
+            free_list_head_ = old_head;
+            count_ --;
         }
     }
 
     template<typename Predicate>
-    SIZE remove_if(Predicate pred) {
-        SIZE removed_count = 0;
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto current = used_head_;
+    SizeType remove_if(Predicate pred) {
+        SizeType removed_count = 0;
+        std::lock_guard<std::mutex> lock(lock_);
+        auto current = head_index_;
 
         while(current != -1) {
-            auto next = node_[current].next;
-            if (pred(*ptr(current))) {
-                remove_node_unsafe(current);
+            auto next = nodes_[current].next_index;
+            if (pred(*element_ptr(current))) {
+                remove_node_nolock(current);
                 removed_count ++;
             }
             current = next;
@@ -289,86 +288,86 @@ public:
     
     template<typename Predicate>
     void clear(Predicate pred) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto current = used_head_;
+        std::lock_guard<std::mutex> lock(lock_);
+        auto current = head_index_;
         while (current != -1) {
-            auto next = node_[current].next;
-            if (pred) pred(*ptr(current));
-            ptr(current)->~T();
+            auto next = nodes_[current].next_index;
+            if (pred) pred(*element_ptr(current));
+            element_ptr(current)->~T();
             current = next;
         }
-        for (SIZE i = 0; i < Capacity; i++) {
-            node_[i].prev = -1;
-            node_[i].next = i + 1;
+        for (SizeType i = 0; i < Capacity; i++) {
+            nodes_[i].prev_index = -1;
+            nodes_[i].next_index = i + 1;
         }
-        node_[Capacity - 1].next = -1;
-        free_head_ = 0;
-        used_head_ = -1;
-        used_tail_ = -1;
-        size_ = 0;
+        nodes_[Capacity - 1].next_index = -1;
+        free_list_head_ = 0;
+        head_index_ = -1;
+        tail_index_ = -1;
+        count_ = 0;
     }
     void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto current = used_head_;
+        std::lock_guard<std::mutex> lock(lock_);
+        auto current = head_index_;
         while (current != -1) {
-            auto next = node_[current].next;
-            ptr(current)->~T();
+            auto next = nodes_[current].next_index;
+            element_ptr(current)->~T();
             current = next;
         }
-        for (SIZE i = 0; i < Capacity; i++) {
-            node_[i].prev = -1;
-            node_[i].next = i + 1;
+        for (SizeType i = 0; i < Capacity; i++) {
+            nodes_[i].prev_index = -1;
+            nodes_[i].next_index = i + 1;
         }
-        node_[Capacity - 1].next = -1;
-        free_head_ = 0;
-        used_head_ = -1;
-        used_tail_ = -1;
-        size_ = 0;
+        nodes_[Capacity - 1].next_index = -1;
+        free_list_head_ = 0;
+        head_index_ = -1;
+        tail_index_ = -1;
+        count_ = 0;
     }
 
 private:
-    T* ptr(INDEX index) {
-        return reinterpret_cast<T*>(&node_[index].data);
+    T* element_ptr(Index index) {
+        return reinterpret_cast<T*>(&nodes_[index].storage);
     }
     
-    const T* ptr(INDEX index) const {
-        return reinterpret_cast<const T*>(&node_[index].data);
+    const T* element_ptr(Index index) const {
+        return reinterpret_cast<const T*>(&nodes_[index].storage);
     }
     
-    void remove_node_unsafe(INDEX index) {
-        if (node_[index].prev == -1) {
-            used_head_ = node_[index].next;
+    void remove_node_nolock(Index index) {
+        if (nodes_[index].prev_index == -1) {
+            head_index_ = nodes_[index].next_index;
         } else {
-            node_[node_[index].prev].next = node_[index].next;
+            nodes_[nodes_[index].prev_index].next_index = nodes_[index].next_index;
         }
 
-        if(node_[index].next == -1) {
-            used_tail_ = node_[index].prev;
+        if(nodes_[index].next_index == -1) {
+            tail_index_ = nodes_[index].prev_index;
         } else {
-            node_[node_[index].next].prev = node_[index].prev;
+            nodes_[nodes_[index].next_index].prev_index = nodes_[index].prev_index;
         }
 
-        ptr(index)->~T();       // 析构对象
+        element_ptr(index)->~T();       // 析构对象
 
-        node_[index].next = free_head_;
-        node_[index].prev = -1;
-        free_head_ = index;
+        nodes_[index].next_index = free_list_head_;
+        nodes_[index].prev_index = -1;
+        free_list_head_ = index;
 
-        size_ --;
+        count_ --;
     }
 
     struct Node {
-        INDEX   prev = -1;
-        INDEX   next = -1;
-        alignas(T) std::byte data[sizeof(T)];
+        Index   prev_index = -1;
+        Index   next_index = -1;
+        alignas(T) std::byte storage[sizeof(T)];
     };
 
-    mutable std::mutex          mutex_;
-    std::array<Node, Capacity>  node_;
-    INDEX                       free_head_ = 0;
-    INDEX                       used_head_ = -1;
-    INDEX                       used_tail_ = -1;
-    SIZE                        size_ = 0;
+    mutable std::mutex          lock_;
+    std::array<Node, Capacity>  nodes_;
+    Index                       free_list_head_ = 0;
+    Index                       head_index_ = -1;
+    Index                       tail_index_ = -1;
+    SizeType                    count_ = 0;
 };
 
 #endif
