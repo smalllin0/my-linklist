@@ -2,5 +2,5 @@ dependencies:
   idf: '>=5.4'
 description: 一个固定长度的双向链表
 license: Apache 2.0
-repository: https://gitee.com/comrade-kobayashi/my-component-library/tree/master/components/my-linklist
-version: 1.0.2
+repository: https://github.com/smalllin0/my-linklist.git
+version: 1.0.3
