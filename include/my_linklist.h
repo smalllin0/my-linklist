@@ -269,6 +269,37 @@ public:
         }
     }
 
+    /// @brief 消费运行时所有在队列中的元素（处理并销毁）
+    /// 注意运行时加入的元素被忽略;运行时元素项也不准确！此时元素无法被清除
+    /// @tparam Consumer 消费对象的函数
+    /// @param fn 接受一个T*参数，处理对象后该对象会被立即销毁
+    /// @note 消费函数不应抛出异常，否则会导致资源泄漏
+    template<typename Consumer>
+    void consume(Consumer fn) {
+        Index start, end;
+        {
+            std::lock_guard<std::mutex> lock(lock_);
+            if (head_index_ == -1) return;
+
+            start = head_index_;
+            end = tail_index_;
+            head_index_ = -1;
+            tail_index_ = -1;
+        }
+            SizeType count = 0;
+            for (auto i = start; i != -1; i = nodes_[i].next_index) {
+                count ++;
+                fn(element_ptr(i));
+                element_ptr(i)->~T();
+            }
+        {
+            std::lock_guard<std::mutex> lock(lock_);
+            nodes_[end].next_index = free_list_head_;
+            free_list_head_ = start;
+            count_ -= count;
+        }
+    }
+
     template<typename Predicate>
     SizeType remove_if(Predicate pred) {
         SizeType removed_count = 0;
@@ -364,10 +395,10 @@ private:
 
     mutable std::mutex          lock_;
     std::array<Node, Capacity>  nodes_;
-    Index                       free_list_head_ = 0;
-    Index                       head_index_ = -1;
-    Index                       tail_index_ = -1;
-    SizeType                    count_ = 0;
+    SizeType                    count_{0};          // 队列使用元素
+    Index                       free_list_head_{0}; // 空闲元素链头
+    Index                       head_index_{-1};    // 已用元素链头
+    Index                       tail_index_{-1};    // 已用元素链尾
 };
 
 #endif
