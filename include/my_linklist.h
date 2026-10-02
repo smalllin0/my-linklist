@@ -131,10 +131,10 @@ public:
         return reserved_;
     }
 
-    /// @brief 容器中既没有已构造元素，也没有 in-flight 元素时为 true
+    /// @brief 容器中既没有已构造元素（不含 in-flight ）时为 true
     [[nodiscard]] bool empty() const noexcept {
         std::lock_guard<std::mutex> lock(mtx_);
-        return used_.size == 0 && reserved_ == 0;
+        return used_.size == 0;
     }
 
     /// @brief 没有空槽可分配时为 true
@@ -259,7 +259,7 @@ public:
     /// @brief 消费调用时刻 used_ 中的所有元素
     ///        内部：锁内 O(1) 整体摘出 → 锁外逐个 fn + 析构 → 锁内 O(1) 归还
     /// @note 回调 fn 在锁外执行，允许慢、阻塞、IO、再次访问本容器
-    ///       （但不能递归调用 consume）。
+    ///       （但不能递归调用 consume、保存指针）。
     ///       只处理 used_ 快照，不处理 reserved_ 节点。
     ///       摘出期间对应节点计入 reserved_，所以 size() 保持稳定。
     template<typename Consumer>
