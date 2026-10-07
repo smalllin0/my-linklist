@@ -5,11 +5,46 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
-#include <new>          // std::launder
+#include <new>
 #include <type_traits>
 #include <utility>
 
-/// @brief 固定容量、线程安全的 FIFO 对象池（双向索引链表实现）
+// ============================================================
+// 内部基类（src/ 下的私有头文件）
+// ============================================================
+// 通过相对路径引用。因为是同一组件内的 .cc/.h 组织，
+// 相对路径编译期可解析——不依赖 include path。
+#include "../src/my_list_base.h"
+
+// ============================================================
+// 锁策略
+// ============================================================
+
+/// @brief 无锁策略：不做任何同步
+///
+/// 适用场景：
+///   - 单线程访问
+///   - 外部已有同步保证（如 IRQ 关中断、FreeRTOS 临界区）
+///   - 明确不需要跨线程安全
+///
+/// @warning 使用此策略时，容器不再线程安全。
+///          多线程访问会导致数据竞争和未定义行为。
+struct NoLock {
+    void lock() noexcept {}
+    void unlock() noexcept {}
+};
+
+// ============================================================
+// 主模板
+// ============================================================
+
+/// @brief 固定容量、FIFO 对象池（双向索引链表实现）
+///
+/// 【线程安全】
+///   由第三个模板参数 LockPolicy 决定：
+///     - std::mutex（默认）：所有公共方法线程安全
+///     - NoLock：无同步，单线程或外部同步下使用
+///     - 自定义策略：需满足 BasicLockable（lock/unlock）
 ///
 /// 【状态模型】
 ///   每个槽位有三种状态：
@@ -21,16 +56,15 @@
 ///     size() = used_.size + reserved_
 ///     full() = (free_.size == 0)
 ///
-/// 【并发契约】
-///   - 所有公共方法线程安全，内部由一把 std::mutex 保护
-///   - for_each 的回调在锁内执行，必须 noexcept、快速、不重入
-///   - consume / erase_if / clear 的析构在锁外执行，允许慢
-///   - consume 的回调在锁外执行，允许慢、阻塞、IO、再次访问本容器
-///     （但不能递归调用 consume）
-///   - consume_front 是逐节点消费，只有“正在处理的那一个”对
-///     clear / erase_if / for_each 不可见
-///   - clear / consume / consume_front / erase_if / for_each 只处理
-///     used_ 节点，不碰 reserved_ 节点
+/// 【并发契约】（仅 LockPolicy 提供同步时有效）
+///   - for_each / last 的回调在锁内执行，必须 noexcept、快速、不重入
+///   - consume / consume_front / consume_to / erase_if / clear
+///     的析构在锁外执行，允许慢
+///   - consume / consume_front / consume_to 的回调在锁外执行，
+///     允许慢、阻塞、IO、再次访问本容器
+///   - consume_front / consume_to 是逐节点消费，只有"正在处理的
+///     那一个"对 clear / erase_if / for_each 不可见
+///   - 所有销毁操作只处理 used_ 节点，不碰 reserved_ 节点
 ///   - 析构 ~MyList() 的前置条件：reserved_ == 0
 ///
 /// 【API 分层】
@@ -38,8 +72,8 @@
 ///                 free_size / capacity
 ///   生产          emplace_back / construct
 ///   短消费        pop_front
-///   长耗时消费    consume / consume_front
-///   锁内遍历      for_each
+///   长耗时消费    consume / consume_front / consume_to
+///   锁内访问      for_each / last
 ///   锁内销毁      erase_if / clear
 ///
 /// 【异常安全】
@@ -47,37 +81,82 @@
 ///   - emplace_back 要求 T 从 Args 构造 noexcept
 ///   - construct    要求 fn 是 noexcept，且 fn 内部保证构造成功
 ///   - pop_front    要求 T 移动赋值 noexcept
-///   - for_each     要求回调 noexcept
-///   - consume / consume_front 要求回调与析构 noexcept
+///   - for_each / last 要求回调 noexcept
+///   - consume / consume_front / consume_to 要求回调与析构 noexcept
 ///   - erase_if     要求谓词与析构 noexcept
-template<typename T, std::int16_t Capacity>
-class MyList {
+template<typename T, std::int16_t Capacity, typename LockPolicy = std::mutex>
+class MyList : private ListBase {
     static_assert(Capacity > 0, "Capacity must be greater than 0");
     static_assert(Capacity <= 32767, "Capacity must fit in Index/Size");
 
 public:
     using Index = std::int16_t;
     using Size  = std::int16_t;
+    using Lock  = LockPolicy;
 
 private:
-    struct Node {
-        Index prev = -1;
-        Index next = -1;
+    /// @brief 节点：NodeBase 作为第一个基类，保证偏移 0
+    struct Node : NodeBase {
         alignas(T) std::byte storage[sizeof(T)];
     };
 
-    /// @brief 双向索引链表头
-    struct List {
-        Index head = -1;
-        Index tail = -1;
-        Size  size = 0;
-    };
+    using Guard = std::lock_guard<LockPolicy>;
 
     std::array<Node, Capacity> nodes_;
     List used_;
     List free_;
-    Size reserved_ = 0;      // 被摘出、尚未挂回任何链的节点数
-    mutable std::mutex mtx_;
+    Size reserved_ = 0;
+    mutable LockPolicy mtx_;
+
+    // ============================================================
+    // 链表操作：转调非模板基类
+    // ============================================================
+
+    NodeView view() noexcept {
+        return NodeView{ nodes_.data(), sizeof(Node) };
+    }
+
+    void init_free_list_unlocked() noexcept {
+        ListBase::init_free_list(free_, view(), Capacity);
+        used_.head = -1;
+        used_.tail = -1;
+        used_.size = 0;
+    }
+
+    Index pop_free_unlocked() noexcept {
+        return ListBase::pop_free_unlocked(free_, view());
+    }
+
+    void push_free_unlocked(Index idx) noexcept {
+        ListBase::push_free_unlocked(free_, view(), idx);
+    }
+
+    Index pop_used_unlocked() noexcept {
+        return ListBase::pop_used_unlocked(used_, view());
+    }
+
+    void push_back_unlocked(List& list, Index idx) noexcept {
+        ListBase::push_back_unlocked(list, view(), idx);
+    }
+
+    void unlink_unlocked(List& list, Index idx) noexcept {
+        ListBase::unlink_unlocked(list, view(), idx);
+    }
+
+    void splice_unlocked(List& dst, List& src) noexcept {
+        ListBase::splice_unlocked(dst, src, view());
+    }
+
+    // ============================================================
+    // 对象访问（依赖 T，保留在模板类）
+    // ============================================================
+
+    T* object_ptr(Index i) noexcept {
+        return std::launder(reinterpret_cast<T*>(&nodes_[i].storage));
+    }
+    const T* object_ptr(Index i) const noexcept {
+        return std::launder(reinterpret_cast<const T*>(&nodes_[i].storage));
+    }
 
 public:
     // ============================================================
@@ -85,23 +164,9 @@ public:
     // ============================================================
 
     MyList() noexcept {
-        // 初始化空闲链：0 -> 1 -> ... -> Capacity-1
-        for (Size i = 0; i < Capacity; ++i) {
-            nodes_[i].prev = (i > 0) ? (i - 1) : -1;
-            nodes_[i].next = (i + 1 < Capacity) ? (i + 1) : -1;
-        }
-        free_.head = 0;
-        free_.tail = Capacity - 1;
-        free_.size = Capacity;
-
-        // 已用链初始为空
-        used_.head = -1;
-        used_.tail = -1;
-        used_.size = 0;
+        init_free_list_unlocked();
     }
 
-    /// @note 前置条件：reserved_ == 0。
-    ///       若仍有线程在锁外构造 / 消费，容器的生命周期不应结束。
     ~MyList() { clear(); }
 
     MyList(const MyList&)            = delete;
@@ -113,39 +178,33 @@ public:
     // 状态查询
     // ============================================================
 
-    /// @brief 已分配槽位数，等于 used_.size + reserved_
     [[nodiscard]] Size size() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         return static_cast<Size>(used_.size + reserved_);
     }
 
-    /// @brief 已构造完成、可被 consume / for_each / erase_if 处理的元素数
     [[nodiscard]] Size used_size() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         return used_.size;
     }
 
-    /// @brief 正在锁外构造 / 消费 / 析构的 in-flight 元素数
     [[nodiscard]] Size reserved_size() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         return reserved_;
     }
 
-    /// @brief 容器中既没有已构造元素（不含 in-flight ）时为 true
     [[nodiscard]] bool empty() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         return used_.size == 0;
     }
 
-    /// @brief 没有空槽可分配时为 true
     [[nodiscard]] bool full() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         return free_.size == 0;
     }
 
-    /// @brief 空闲槽数
     [[nodiscard]] Size free_size() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         return free_.size;
     }
 
@@ -166,17 +225,16 @@ public:
 
         Index idx;
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            Guard lock(mtx_);
             idx = pop_free_unlocked();
             if (idx == -1) return false;
             ++reserved_;
         }
 
-        // 锁外构造
         new (object_ptr(idx)) T(std::forward<Args>(args)...);
 
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            Guard lock(mtx_);
             --reserved_;
             push_back_unlocked(used_, idx);
         }
@@ -197,17 +255,16 @@ public:
 
         Index idx;
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            Guard lock(mtx_);
             idx = pop_free_unlocked();
             if (idx == -1) return false;
             ++reserved_;
         }
 
-        // 锁外构造
         fn(object_ptr(idx));
 
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            Guard lock(mtx_);
             --reserved_;
             push_back_unlocked(used_, idx);
         }
@@ -227,7 +284,7 @@ public:
                       "T must be nothrow move assignable");
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
-        std::lock_guard<std::mutex> lock(mtx_);
+        Guard lock(mtx_);
         Index idx = pop_used_unlocked();
         if (idx == -1) return false;
         out = std::move(*object_ptr(idx));
@@ -237,19 +294,33 @@ public:
     }
 
     // ============================================================
-    // 锁内遍历
+    // 锁内访问
     // ============================================================
 
     /// @brief 按 FIFO 顺序遍历 used_ 中的所有元素，对每个元素调用 fn
+    /// @return 若 fn 返回 true 则提前终止遍历
     /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
     template<typename F>
     void for_each(F&& fn) noexcept {
-        static_assert(std::is_nothrow_invocable_v<F&, T&>,
-                      "F must be nothrow invocable with T&");
-        std::lock_guard<std::mutex> lock(mtx_);
+        static_assert(std::is_nothrow_invocable_r_v<bool, F&, T&>,
+                      "F must be nothrow invocable, returning bool");
+        Guard lock(mtx_);
         for (Index i = used_.head; i != -1; i = nodes_[i].next) {
-            fn(*object_ptr(i));
+            if (fn(*object_ptr(i))) return;
         }
+    }
+
+    /// @brief 锁内只读访问 used_ 尾部节点
+    /// @return 队列为空返回 false；否则调用 fn(*tail) 并返回 true
+    /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
+    template<typename F>
+    [[nodiscard]] bool last(F&& fn) const noexcept {
+        static_assert(std::is_nothrow_invocable_r_v<void, F&, const T&>,
+                      "F must be nothrow invocable with const T&");
+        Guard lock(mtx_);
+        if (used_.tail == -1) return false;
+        fn(*object_ptr(used_.tail));
+        return true;
     }
 
     // ============================================================
@@ -259,9 +330,7 @@ public:
     /// @brief 消费调用时刻 used_ 中的所有元素
     ///        内部：锁内 O(1) 整体摘出 → 锁外逐个 fn + 析构 → 锁内 O(1) 归还
     /// @note 回调 fn 在锁外执行，允许慢、阻塞、IO、再次访问本容器
-    ///       （但不能递归调用 consume、保存指针）。
-    ///       只处理 used_ 快照，不处理 reserved_ 节点。
-    ///       摘出期间对应节点计入 reserved_，所以 size() 保持稳定。
+    ///       （但不能递归调用 consume）。
     template<typename Consumer>
     void consume(Consumer fn) noexcept {
         static_assert(std::is_nothrow_invocable_v<Consumer, T*>,
@@ -271,23 +340,15 @@ public:
 
         List tmp;
         {
-            std::lock_guard<std::mutex> lock(mtx_);
-            tmp = used_;
-            used_ = List{};
-            reserved_ += tmp.size;
+            Guard lock(mtx_);
+            detach_all_locked(tmp);
         }
 
-        for (Index i = tmp.head; i != -1; ) {
-            Index next = nodes_[i].next;
-            fn(object_ptr(i));
-            object_ptr(i)->~T();
-            i = next;
-        }
+        destroy_list_unlocked(tmp, fn);
 
         {
-            std::lock_guard<std::mutex> lock(mtx_);
-            reserved_ -= tmp.size;
-            splice_unlocked(free_, tmp);
+            Guard lock(mtx_);
+            reclaim_locked(tmp);
         }
     }
 
@@ -302,7 +363,7 @@ public:
     ///                        clear / erase_if / for_each 不可见
     ///       - consume_front  逐节点，只有正在处理的那一个对
     ///                        clear / erase_if / for_each 不可见
-    ///       适合“边消费边能被 Clear 看到剩余任务”的场景。
+    ///       适合"边消费边能被 Clear 看到剩余任务"的场景。
     ///       fn 与析构必须 noexcept。
     template<typename Consumer>
     bool consume_front(Consumer fn) noexcept {
@@ -310,24 +371,36 @@ public:
                       "Consumer must be nothrow invocable with T*");
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
+        return consume_to([&](T* p) noexcept {
+            fn(p);
+            return false;
+        }) > 0;
+    }
 
-        Index idx;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            idx = pop_used_unlocked();
-            if (idx == -1) return false;
-            ++reserved_;
-        }
+    /// @brief 从 used_ 头部开始消费，直到 fn 返回 true（该节点保留）或队列为空
+    /// @return 消费掉的节点数
+    /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
+    ///       返回 true 表示"保留该节点并停止消费"。
+    template<typename Consumer>
+    Size consume_to(Consumer fn) noexcept {
+        static_assert(std::is_nothrow_invocable_r_v<bool, Consumer, T*>,
+                      "Consumer must be nothrow invocable with T*, returning bool");
+        static_assert(std::is_nothrow_destructible_v<T>,
+                      "T must be nothrow destructible");
 
-        fn(object_ptr(idx));
-        object_ptr(idx)->~T();
+        Size consumed = 0;
+        Guard lock(mtx_);
 
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            --reserved_;
+        while (used_.head != -1) {
+            Index i = used_.head;
+            if (fn(object_ptr(i))) break;
+
+            Index idx = pop_used_unlocked();
+            object_ptr(idx)->~T();
             push_free_unlocked(idx);
+            ++consumed;
         }
-        return true;
+        return consumed;
     }
 
     // ============================================================
@@ -338,173 +411,98 @@ public:
     /// @return 被移除的元素数量
     /// @note 谓词在锁内执行，必须 noexcept 且快。
     ///       析构在锁外执行，允许慢。
-    ///       只处理 used_，不处理 reserved_ 节点。
     template<typename Predicate>
     Size erase_if(Predicate pred) noexcept {
         static_assert(std::is_nothrow_invocable_r_v<bool, Predicate&, T&>,
                       "Predicate must be nothrow invocable returning bool");
-        static_assert(std::is_nothrow_destructible_v<T>,
-                      "T must be nothrow destructible");
 
-        List removed;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            Index i = used_.head;
-            while (i != -1) {
-                Index next = nodes_[i].next;
-                if (pred(*object_ptr(i))) {
-                    unlink_unlocked(used_, i);
-                    push_back_unlocked(removed, i);
-                }
-                i = next;
-            }
-            if (removed.size > 0) {
-                reserved_ += removed.size;
-            }
-        }
-
-        const Size count = removed.size;
-        if (count == 0) return 0;
-
-        for (Index i = removed.head; i != -1; i = nodes_[i].next) {
-            object_ptr(i)->~T();
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            reserved_ -= removed.size;
-            splice_unlocked(free_, removed);
-        }
-        return count;
+        return erase_impl([&](List& dst) noexcept {
+            return detach_if_locked(dst, pred);
+        });
     }
 
     /// @brief 清空 used_ 中的所有元素
     /// @note 析构在锁外执行，允许慢。
-    ///       不处理 reserved_ 节点。清空后 size() 可能不为 0（等于 reserved_）。
+    ///       不处理 reserved_ 节点。清空后 size() 可能不为 0。
     void clear() noexcept {
+        erase_impl([this](List& dst) noexcept {
+            return detach_all_locked(dst);
+        });
+    }
+
+private:
+    // ============================================================
+    // 内部辅助：擦除骨架
+    // ============================================================
+
+    template<typename Detach>
+    Size erase_impl(Detach detach) noexcept {
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
 
         List removed;
         {
-            std::lock_guard<std::mutex> lock(mtx_);
-            removed = used_;
-            used_ = List{};
-            reserved_ += removed.size;
+            Guard lock(mtx_);
+            if (detach(removed) == 0) return 0;
         }
 
-        if (removed.size == 0) return;
-
-        for (Index i = removed.head; i != -1; i = nodes_[i].next) {
-            object_ptr(i)->~T();
-        }
+        destroy_list_unlocked(removed, [](T*) noexcept {});
 
         {
-            std::lock_guard<std::mutex> lock(mtx_);
-            reserved_ -= removed.size;
-            splice_unlocked(free_, removed);
+            Guard lock(mtx_);
+            reclaim_locked(removed);
+        }
+        return removed.size;
+    }
+
+    Size detach_all_locked(List& dst) noexcept {
+        dst = used_;
+        used_ = List{};
+        reserved_ += dst.size;
+        return dst.size;
+    }
+
+    template<typename Predicate>
+    Size detach_if_locked(List& dst, Predicate pred) noexcept {
+        Size count = 0;
+        Index i = used_.head;
+        while (i != -1) {
+            Index next = nodes_[i].next;
+            if (pred(*object_ptr(i))) {
+                unlink_unlocked(used_, i);
+                push_back_unlocked(dst, i);
+                ++count;
+            }
+            i = next;
+        }
+        if (count > 0) reserved_ += count;
+        return count;
+    }
+
+    template<typename F>
+    void destroy_list_unlocked(List& list, F&& pre_destroy) noexcept {
+        for (Index i = list.head; i != -1; i = nodes_[i].next) {
+            pre_destroy(object_ptr(i));
+            object_ptr(i)->~T();
         }
     }
 
-private:
-    // ============================================================
-    // 内部辅助（全部不加锁，调用方必须持锁）
-    // ============================================================
-
-    T* object_ptr(Index i) noexcept {
-        return std::launder(reinterpret_cast<T*>(&nodes_[i].storage));
-    }
-    const T* object_ptr(Index i) const noexcept {
-        return std::launder(reinterpret_cast<const T*>(&nodes_[i].storage));
-    }
-
-    // ---------- 空槽链 ----------
-
-    Index pop_free_unlocked() noexcept {
-        if (free_.head == -1) return -1;
-        Index idx = free_.head;
-        free_.head = nodes_[idx].next;
-        if (free_.head == -1) {
-            free_.tail = -1;
-        } else {
-            nodes_[free_.head].prev = -1;
-        }
-        --free_.size;
-        return idx;
-    }
-
-    void push_free_unlocked(Index idx) noexcept {
-        nodes_[idx].prev = -1;
-        nodes_[idx].next = free_.head;
-        if (free_.head == -1) {
-            free_.tail = idx;
-        } else {
-            nodes_[free_.head].prev = idx;
-        }
-        free_.head = idx;
-        ++free_.size;
-    }
-
-    // ---------- 已用链 ----------
-
-    Index pop_used_unlocked() noexcept {
-        if (used_.head == -1) return -1;
-        Index idx = used_.head;
-        used_.head = nodes_[idx].next;
-        if (used_.head == -1) {
-            used_.tail = -1;
-        } else {
-            nodes_[used_.head].prev = -1;
-        }
-        --used_.size;
-        return idx;
-    }
-
-    // ---------- 通用链表操作 ----------
-
-    void push_back_unlocked(List& list, Index idx) noexcept {
-        nodes_[idx].prev = list.tail;
-        nodes_[idx].next = -1;
-        if (list.tail == -1) {
-            list.head = idx;
-        } else {
-            nodes_[list.tail].next = idx;
-        }
-        list.tail = idx;
-        ++list.size;
-    }
-
-    void unlink_unlocked(List& list, Index idx) noexcept {
-        Index prev = nodes_[idx].prev;
-        Index next = nodes_[idx].next;
-        if (prev == -1) {
-            list.head = next;
-        } else {
-            nodes_[prev].next = next;
-        }
-        if (next == -1) {
-            list.tail = prev;
-        } else {
-            nodes_[next].prev = prev;
-        }
-        --list.size;
-        nodes_[idx].prev = -1;
-        nodes_[idx].next = -1;
-    }
-
-    void splice_unlocked(List& dst, List& src) noexcept {
-        if (src.head == -1) return;
-        if (dst.tail == -1) {
-            dst.head = src.head;
-            dst.tail = src.tail;
-        } else {
-            nodes_[dst.tail].next = src.head;
-            nodes_[src.head].prev = dst.tail;
-            dst.tail = src.tail;
-        }
-        dst.size = static_cast<Size>(dst.size + src.size);
-        src = List{};
+    void reclaim_locked(List& lst) noexcept {
+        reserved_ -= lst.size;
+        splice_unlocked(free_, lst);
     }
 };
+
+// ============================================================
+// 便捷别名
+// ============================================================
+
+/// @brief 线程安全版本（内部互斥锁）
+template<typename T, std::int16_t Capacity>
+using ThreadSafeList = MyList<T, Capacity, std::mutex>;
+
+/// @brief 无锁版本（调用方保证无并发）
+template<typename T, std::int16_t Capacity>
+using UnsafeList = MyList<T, Capacity, NoLock>;
 
 #endif  // MY_LIST_H_

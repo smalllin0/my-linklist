@@ -1,8 +1,13 @@
+file(GLOB SOURCE_CODE
+    "src/*.cc"
+)
+
+
 idf_component_register(
     SRCS
+        ${SOURCE_CODE}
     INCLUDE_DIRS
         "include"
-    REQUIRES
 )
 
 # 禁用 C++ 异常（本组件要求 -fno-exceptions 环境）
