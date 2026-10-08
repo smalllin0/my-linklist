@@ -9,11 +9,7 @@
 #include <type_traits>
 #include <utility>
 
-// ============================================================
-// 内部基类（src/ 下的私有头文件）
-// ============================================================
-// 通过相对路径引用。因为是同一组件内的 .cc/.h 组织，
-// 相对路径编译期可解析——不依赖 include path。
+
 #include "../src/my_list_base.h"
 
 // ============================================================
@@ -33,9 +29,8 @@ struct NoLock {
 };
 
 // ============================================================
-// 主模板
+// MyList模板
 // ============================================================
-
 /// @brief 固定容量、FIFO 对象池（双向索引链表实现）
 /// 【线程安全】
 ///   由第三个模板参数 LockPolicy 决定：
@@ -364,10 +359,25 @@ public:
                       "Consumer must be nothrow invocable with T*");
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
-        return consume_to([&](T* p) noexcept {
-            fn(p);
-            return false;
-        }) > 0;
+
+        Index idx;
+        {
+            Guard lock(mtx_);
+            idx = pop_used_unlocked();
+            if (idx == -1) return false;
+            ++reserved_;
+        }
+
+        fn(object_ptr(idx));        
+        object_ptr(idx)->~T();      
+
+        {
+            Guard lock(mtx_);
+            --reserved_;
+            push_free_unlocked(idx);
+        }
+        return true;
+
     }
 
     /// @brief 从 used_ 头部开始消费，直到 fn 返回 true（该节点保留）或队列为空
