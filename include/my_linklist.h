@@ -21,12 +21,10 @@
 // ============================================================
 
 /// @brief 无锁策略：不做任何同步
-///
 /// 适用场景：
 ///   - 单线程访问
 ///   - 外部已有同步保证（如 IRQ 关中断、FreeRTOS 临界区）
 ///   - 明确不需要跨线程安全
-///
 /// @warning 使用此策略时，容器不再线程安全。
 ///          多线程访问会导致数据竞争和未定义行为。
 struct NoLock {
@@ -39,13 +37,11 @@ struct NoLock {
 // ============================================================
 
 /// @brief 固定容量、FIFO 对象池（双向索引链表实现）
-///
 /// 【线程安全】
 ///   由第三个模板参数 LockPolicy 决定：
 ///     - std::mutex（默认）：所有公共方法线程安全
 ///     - NoLock：无同步，单线程或外部同步下使用
 ///     - 自定义策略：需满足 BasicLockable（lock/unlock）
-///
 /// 【状态模型】
 ///   每个槽位有三种状态：
 ///     free     在 free_ 链上，未构造
@@ -55,7 +51,6 @@ struct NoLock {
 ///     free_.size + used_.size + reserved_ == Capacity
 ///     size() = used_.size + reserved_
 ///     full() = (free_.size == 0)
-///
 /// 【并发契约】（仅 LockPolicy 提供同步时有效）
 ///   - for_each / last 的回调在锁内执行，必须 noexcept、快速、不重入
 ///   - consume / consume_front / consume_to / erase_if / clear
@@ -63,19 +58,17 @@ struct NoLock {
 ///   - consume / consume_front / consume_to 的回调在锁外执行，
 ///     允许慢、阻塞、IO、再次访问本容器
 ///   - consume_front / consume_to 是逐节点消费，只有"正在处理的
-///     那一个"对 clear / erase_if / for_each 不可见
+///     节点"对 clear / erase_if / for_each 不可见
 ///   - 所有销毁操作只处理 used_ 节点，不碰 reserved_ 节点
 ///   - 析构 ~MyList() 的前置条件：reserved_ == 0
-///
 /// 【API 分层】
 ///   状态查询      size / used_size / reserved_size / empty / full /
-///                 free_size / capacity
+///                free_size / capacity
 ///   生产          emplace_back / construct
 ///   短消费        pop_front
 ///   长耗时消费    consume / consume_front / consume_to
 ///   锁内访问      for_each / last
 ///   锁内销毁      erase_if / clear
-///
 /// 【异常安全】
 ///   - 除 emplace_back / construct 外，其余方法均 noexcept
 ///   - emplace_back 要求 T 从 Args 构造 noexcept
@@ -148,7 +141,7 @@ private:
     }
 
     // ============================================================
-    // 对象访问（依赖 T，保留在模板类）
+    // 对象访问（依赖 T）
     // ============================================================
 
     T* object_ptr(Index i) noexcept {
@@ -388,19 +381,30 @@ public:
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
 
-        Size consumed = 0;
-        Guard lock(mtx_);
+        List consume_list;
+        {
+            Guard lock(mtx_);
+            while (used_.head != -1) {
+                auto i = used_.head;
+                if (fn(object_ptr(i))) break;
 
-        while (used_.head != -1) {
-            Index i = used_.head;
-            if (fn(object_ptr(i))) break;
-
-            Index idx = pop_used_unlocked();
-            object_ptr(idx)->~T();
-            push_free_unlocked(idx);
-            ++consumed;
+                auto idx = pop_used_unlocked();
+                push_back_unlocked(consume_list, idx);
+            }
+            if (consume_list.size == 0) return 0;
+            reserved_ += consume_list.size;
         }
-        return consumed;
+
+        for (auto i = consume_list.head; i != -1; i = nodes_[i].next) {
+            object_ptr(i)->~T();
+        }
+
+        {
+            Guard lock(mtx_);
+            reserved_ -= consume_list.size;
+            splice_unlocked(free_, consume_list);
+        }
+        return consume_list.size;
     }
 
     // ============================================================
