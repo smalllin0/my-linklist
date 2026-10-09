@@ -1,0 +1,6 @@
+name: Test
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+    test:
+        uses: smalllin0/my-ci-templates/.github/workflows/test.yml@main
