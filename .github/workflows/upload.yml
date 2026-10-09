@@ -6,7 +6,7 @@ on:
 
 jobs:
     upload:
-        uses: smalllin0/ci-template/.github/workflows/upload.yml@master
+        uses: smalllin0/my-ci-template/.github/workflows/upload.yml@master
         with:   
             namespace: smallin
         secrets:
