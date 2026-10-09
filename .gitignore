@@ -1,2 +1,13 @@
+build/
 dist/
+sdkconfig
+sdkconfig.old
+*.o
+*.a
+*.elf
+*.bin
+*.vscode/
+.idea/
+managed_components/
+dependencires.lock
 idf_component.yml
