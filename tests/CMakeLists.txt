@@ -1,18 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
 project(my_linklist_tests)
 
-set(CMAKE_CXX_STANDARD  23)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 从 tests/ 往上推导
+get_filename_component(ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
+# 测试可执行文件
 add_executable(test_my_linklist
-    test_my_linklist.cc
-    ../src/my_list_base.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_my_linklist.cc
+    ${ROOT_DIR}/src/my_list_base.cc
 )
+
 target_include_directories(test_my_linklist PRIVATE
-    ../include
-    ../src
-    ../../../my-test-utils/include         # 引用共享工具
+    ${ROOT_DIR}/include
+    ${ROOT_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}          # ← 关键：从本地找 test_helpers.h
 )
+
 target_compile_options(test_my_linklist PRIVATE
     -Wall -Wextra
     -fsanitize=address,undefined
