@@ -1,0 +1,12 @@
+name: Upload to Component Registry
+on: 
+    push:
+        tags: ['v*']
+
+jobs:
+    upload:
+        uses: smalllin0/ci-template/.github/workflows/upload.yml@main
+        with:   
+            namespace: smallin
+        secrets:
+            IDF_COMPONENT_API_TOKEN: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
