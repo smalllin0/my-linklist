@@ -460,13 +460,14 @@ private:
             if (detach(removed) == 0) return 0;
         }
 
+        auto size = removed.size;
         destroy_list_unlocked(removed, [](T*) noexcept {});
 
         {
             Guard lock(mtx_);
             reclaim_locked(removed);
         }
-        return removed.size;
+        return size;
     }
 
     Size detach_all_locked(List& dst) noexcept {
