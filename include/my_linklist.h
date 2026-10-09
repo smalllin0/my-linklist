@@ -47,13 +47,12 @@ struct NoLock {
 ///     size() = used_.size + reserved_
 ///     full() = (free_.size == 0)
 /// 【并发契约】（仅 LockPolicy 提供同步时有效）
-///   - for_each / last 的回调在锁内执行，必须 noexcept、快速、不重入
-///   - consume / consume_front / consume_to / erase_if / clear
-///     的析构在锁外执行，允许慢
-///   - consume / consume_front / consume_to 的回调在锁外执行，
+///   - for_each / last / consume_to / erase_if 的回调在锁内执行，
+///     必须 noexcept、快速、不重入
+///   - consume / consume_front / construct 的回调在锁外执行，
 ///     允许慢、阻塞、IO、再次访问本容器
-///   - consume_front / consume_to 是逐节点消费，只有"正在处理的
-///     节点"对 clear / erase_if / for_each 不可见
+///   - consume_front 是逐节点消费，只有"正在处理的节点"对
+///     clear / erase_if / for_each 不可见
 ///   - 所有销毁操作只处理 used_ 节点，不碰 reserved_ 节点
 ///   - 析构 ~MyList() 的前置条件：reserved_ == 0
 /// 【API 分层】
@@ -61,7 +60,8 @@ struct NoLock {
 ///                free_size / capacity
 ///   生产          emplace_back / construct
 ///   短消费        pop_front
-///   长耗时消费    consume / consume_front / consume_to
+///   长耗时消费    consume / consume_front
+///   锁内条件消费  consume_to
 ///   锁内访问      for_each / last
 ///   锁内销毁      erase_if / clear
 /// 【异常安全】
@@ -69,9 +69,8 @@ struct NoLock {
 ///   - emplace_back 要求 T 从 Args 构造 noexcept
 ///   - construct    要求 fn 是 noexcept，且 fn 内部保证构造成功
 ///   - pop_front    要求 T 移动赋值 noexcept
-///   - for_each / last 要求回调 noexcept
-///   - consume / consume_front / consume_to 要求回调与析构 noexcept
-///   - erase_if     要求谓词与析构 noexcept
+///   - for_each / last / consume_to / erase_if 要求回调与析构 noexcept
+///   - consume / consume_front 要求回调与析构 noexcept
 template<typename T, std::int16_t Capacity, typename LockPolicy = std::mutex>
 class MyList : private ListBase {
     static_assert(Capacity > 0, "Capacity must be greater than 0");
@@ -288,23 +287,26 @@ public:
     /// @brief 按 FIFO 顺序遍历 used_ 中的所有元素，对每个元素调用 fn
     /// @return 若 fn 返回 true 则提前终止遍历
     /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
+    ///       非 const 版本：回调接受 T&，可修改元素。
     template<typename F>
     void for_each(F&& fn) noexcept {
         static_assert(std::is_nothrow_invocable_r_v<bool, F&, T&>,
-                      "F must be nothrow invocable, returning bool");
+                      "F must be nothrow invocable with T&, returning bool");
         Guard lock(mtx_);
         for (Index i = used_.head; i != -1; i = nodes_[i].next) {
             if (fn(*object_ptr(i))) return;
         }
     }
 
-    /// @brief 锁内只读访问 used_ 尾部节点
+
+    /// @brief 锁内访问 used_ 尾部节点
     /// @return 队列为空返回 false；否则调用 fn(*tail) 并返回 true
     /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
+    ///       回调接受 T&，可修改尾部元素。
     template<typename F>
-    [[nodiscard]] bool last(F&& fn) const noexcept {
-        static_assert(std::is_nothrow_invocable_r_v<void, F&, const T&>,
-                      "F must be nothrow invocable with const T&");
+    [[nodiscard]] bool last(F&& fn) noexcept {
+        static_assert(std::is_nothrow_invocable_r_v<void, F&, T&>,
+                      "F must be nothrow invocable with T&");
         Guard lock(mtx_);
         if (used_.tail == -1) return false;
         fn(*object_ptr(used_.tail));
@@ -318,11 +320,11 @@ public:
     /// @brief 消费调用时刻 used_ 中的所有元素
     ///        内部：锁内 O(1) 整体摘出 → 锁外逐个 fn + 析构 → 锁内 O(1) 归还
     /// @note 回调 fn 在锁外执行，允许慢、阻塞、IO、再次访问本容器
-    ///       （但不能递归调用 consume）。
+    ///       （但不能递归调用 consume）。回调接受 T&。
     template<typename Consumer>
     void consume(Consumer fn) noexcept {
-        static_assert(std::is_nothrow_invocable_v<Consumer, T*>,
-                      "Consumer must be nothrow invocable with T*");
+        static_assert(std::is_nothrow_invocable_v<Consumer, T&>,
+                      "Consumer must be nothrow invocable with T&");
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
 
@@ -352,11 +354,11 @@ public:
     ///       - consume_front  逐节点，只有正在处理的那一个对
     ///                        clear / erase_if / for_each 不可见
     ///       适合"边消费边能被 Clear 看到剩余任务"的场景。
-    ///       fn 与析构必须 noexcept。
+    ///       fn 与析构必须 noexcept。回调接受 T&。
     template<typename Consumer>
     bool consume_front(Consumer fn) noexcept {
-        static_assert(std::is_nothrow_invocable_v<Consumer, T*>,
-                      "Consumer must be nothrow invocable with T*");
+        static_assert(std::is_nothrow_invocable_v<Consumer, T&>,
+                      "Consumer must be nothrow invocable with T&");
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
 
@@ -368,7 +370,7 @@ public:
             ++reserved_;
         }
 
-        fn(object_ptr(idx));        
+        fn(*object_ptr(idx));        
         object_ptr(idx)->~T();      
 
         {
@@ -383,11 +385,11 @@ public:
     /// @brief 从 used_ 头部开始消费，直到 fn 返回 true（该节点保留）或队列为空
     /// @return 消费掉的节点数
     /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
-    ///       返回 true 表示"保留该节点并停止消费"。
+    ///       返回 true 表示"保留该节点并停止消费"。回调接受 T&。
     template<typename Consumer>
     Size consume_to(Consumer fn) noexcept {
-        static_assert(std::is_nothrow_invocable_r_v<bool, Consumer, T*>,
-                      "Consumer must be nothrow invocable with T*, returning bool");
+        static_assert(std::is_nothrow_invocable_r_v<bool, Consumer, T&>,
+                      "Consumer must be nothrow invocable with T&, returning bool");
         static_assert(std::is_nothrow_destructible_v<T>,
                       "T must be nothrow destructible");
 
@@ -396,7 +398,7 @@ public:
             Guard lock(mtx_);
             while (used_.head != -1) {
                 auto i = used_.head;
-                if (fn(object_ptr(i))) break;
+                if (fn(*object_ptr(i))) break;
 
                 auto idx = pop_used_unlocked();
                 push_back_unlocked(consume_list, idx);
@@ -423,12 +425,12 @@ public:
 
     /// @brief 移除所有满足谓词的元素
     /// @return 被移除的元素数量
-    /// @note 谓词在锁内执行，必须 noexcept 且快。
+    /// @note 谓词在锁内执行，必须 noexcept 且快，接受 const T&。
     ///       析构在锁外执行，允许慢。
     template<typename Predicate>
     Size erase_if(Predicate pred) noexcept {
-        static_assert(std::is_nothrow_invocable_r_v<bool, Predicate&, T&>,
-                      "Predicate must be nothrow invocable returning bool");
+        static_assert(std::is_nothrow_invocable_r_v<bool, Predicate&, const T&>,
+                      "Predicate must be nothrow invocable with const T& returning bool");
 
         return erase_impl([&](List& dst) noexcept {
             return detach_if_locked(dst, pred);
@@ -461,7 +463,7 @@ private:
         }
 
         auto size = removed.size;
-        destroy_list_unlocked(removed, [](T*) noexcept {});
+        destroy_list_unlocked(removed, [](T&) noexcept {});
 
         {
             Guard lock(mtx_);
@@ -497,7 +499,7 @@ private:
     template<typename F>
     void destroy_list_unlocked(List& list, F&& pre_destroy) noexcept {
         for (Index i = list.head; i != -1; i = nodes_[i].next) {
-            pre_destroy(object_ptr(i));
+            pre_destroy(*object_ptr(i));
             object_ptr(i)->~T();
         }
     }
