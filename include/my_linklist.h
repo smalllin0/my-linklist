@@ -411,12 +411,13 @@ public:
             object_ptr(i)->~T();
         }
 
+        auto consume_size = consume_list.size;
         {
             Guard lock(mtx_);
             reserved_ -= consume_list.size;
             splice_unlocked(free_, consume_list);
         }
-        return consume_list.size;
+        return consume_size;
     }
 
     // ============================================================
