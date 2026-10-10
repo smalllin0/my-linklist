@@ -5,4 +5,4 @@ jobs:
     build:
         uses: smalllin0/my-ci-templates/.github/workflows/build.yml@master
         with:
-            targets: '["esp32c3", "esp32s32"]'
+            targets: '["esp32c3"]'
