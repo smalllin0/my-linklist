@@ -1,4 +1,4 @@
-name: Upload to Component Registry
+name: 上传组件
 on: 
     push:
         tags: ['v*']
