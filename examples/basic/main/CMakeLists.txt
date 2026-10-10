@@ -1,5 +1,4 @@
 idf_component_register(
-    SRCS "main.cc" "main.c"
-    INCLUDE_DIRS "."
-    REQUIRED_COMPONENTS "my-linklist"
+    SRCS "main.cc"
+    REQUIRES "my-linklist"
 )
