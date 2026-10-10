@@ -119,7 +119,8 @@ static void demo_consume_to() {
     ESP_LOGI(TAG, "消费了 %d 个；used_size = %d", (int)n, (int)list.used_size());
 
     int head = 0;
-    list.pop_front(head);
+    auto ok = list.pop_front(head);
+    ok = false; // 防止编译器警告
     ESP_LOGI(TAG, "剩下的队头 = %d（应为 3）", head);
 }
 
