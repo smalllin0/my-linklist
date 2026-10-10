@@ -7,6 +7,7 @@ sdkconfig.old
 *.elf
 *.bin
 *.vscode/
+*.lock
 .idea/
 managed_components/
 dependencires.lock
