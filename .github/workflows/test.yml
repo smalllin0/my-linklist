@@ -1,4 +1,4 @@
-name: 运行测试
+name: 客户机模拟测试
 on: [push, pull_request, workflow_dispatch]
 
 jobs:

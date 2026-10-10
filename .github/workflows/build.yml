@@ -1,4 +1,4 @@
-name: 编译
+name: IDF编译测试
 on: [push, pull_request, workflow_dispatch]
 
 jobs:
