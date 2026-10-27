@@ -185,7 +185,7 @@ static bool test_empty_list_operations() {
     int visited = 0;
     list.for_each([&](int&) noexcept {
         visited++;
-        return false;
+        return true;
     });
     TEST_ASSERT_EQ(visited, 0, "空列表 for_each 不执行回调");
 
@@ -441,7 +441,7 @@ static bool test_for_each_early_exit() {
     list.for_each([&](Tracked& t) noexcept {
         if (index == 2) return true;
         result[index++] = t.value;
-        return false;
+        return true;
     });
 
     TEST_ASSERT_EQ(index,     2,  "for_each 访问的元素数");
@@ -461,7 +461,7 @@ static bool test_for_each_full_traversal() {
     list.for_each([&](int& v) noexcept {
         sum += v;
         count++;
-        return false;
+        return true;
     });
 
     TEST_ASSERT_EQ(count, 5,                    "访问全部 5 个");

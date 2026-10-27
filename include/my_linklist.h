@@ -285,7 +285,7 @@ public:
     // ============================================================
 
     /// @brief 按 FIFO 顺序遍历 used_ 中的所有元素，对每个元素调用 fn
-    /// @return 若 fn 返回 true 则提前终止遍历
+    /// @return 若 fn 返回 false 则提前终止遍历
     /// @note 回调在锁内执行，必须 noexcept、快速、不重入本容器。
     ///       非 const 版本：回调接受 T&，可修改元素。
     template<typename F>
@@ -294,7 +294,7 @@ public:
                       "F must be nothrow invocable with T&, returning bool");
         Guard lock(mtx_);
         for (Index i = used_.head; i != -1; i = nodes_[i].next) {
-            if (fn(*object_ptr(i))) return;
+            if (!fn(*object_ptr(i))) return;
         }
     }
 

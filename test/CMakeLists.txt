@@ -36,13 +36,22 @@ target_include_directories(${TARGET}
 
 target_compile_options(${TARGET} PRIVATE
     -Wall -Wextra
-    -fsanitize=address,undefined
-    -fno-omit-frame-pointer
     -g -O1
 )
-target_link_options(${TARGET} PRIVATE
-    -fsanitize=address,undefined
-)
+
+# ASan 需要预留约 16TB 影子内存地址空间，若环境限制了 ulimit -v
+# （容器 / CI 常见），启动会直接报 ReserveShadowMemoryRange failed。
+# 此类环境用 -DLINKLIST_SANITIZE=OFF 构建，其余用例照跑。
+option(LINKLIST_SANITIZE "Enable ASan/UBSan for host tests" ON)
+if(LINKLIST_SANITIZE)
+    target_compile_options(${TARGET} PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(${TARGET} PRIVATE
+        -fsanitize=address,undefined
+    )
+endif()
 
 enable_testing()
 add_test(NAME ${TARGET} COMMAND ${TARGET})
